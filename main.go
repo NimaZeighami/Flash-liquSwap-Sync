@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/ethereum/go-ethereum/accounts"
 	"io"
 	"log"
 	"math/big"
@@ -24,7 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // #############################################################################
@@ -41,10 +40,17 @@ const (
 	WETH_ADDRESS           = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 
 	// -- Default Parameters --
-	DEFAULT_ETH_AMOUNT       = "0.012"  // ETH to swap
-	DEFAULT_TOKEN_ADDRESS    = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" 
-	DEFAULT_SLIPPAGE         = 0.01  // 0.1%
-	DEFAULT_DEADLINE_SECONDS = 120    // 2 minutes
+	DEFAULT_ETH_AMOUNT       = "0.012" // ETH to swap
+	DEFAULT_TOKEN_ADDRESS    = "0xF7285d17dded63A4480A0f1F0a8cc706F02dDa0a"
+	DEFAULT_SLIPPAGE         = 0.01 // 1%
+	DEFAULT_DEADLINE_SECONDS = 120  // 2 minutes
+
+	// -- Dynamic Gas Parameters --
+	PRIORITY_FEE_MULTIPLIER  = 3.0  // 3x current priority fee for fast inclusion
+	BASE_FEE_MULTIPLIER      = 2.5  // 2.5x current base fee buffer
+	GAS_LIMIT_BUFFER_PERCENT = 30   // 30% buffer on gas estimates
+	MIN_PRIORITY_FEE_GWEI    = 2.0  // Minimum 2 Gwei priority fee
+	MAX_PRIORITY_FEE_GWEI    = 50.0 // Maximum 50 Gwei priority fee
 )
 
 // Contract ABIs
@@ -161,6 +167,14 @@ type Config struct {
 	DeadlineSeconds    int64
 }
 
+type GasParams struct {
+	GasLimit       uint64
+	MaxFeePerGas   *big.Int
+	MaxPriorityFee *big.Int
+	IsLegacy       bool
+	LegacyGasPrice *big.Int
+}
+
 type FlashbotsBundle struct {
 	Txs         []string `json:"txs"`
 	BlockNumber string   `json:"blockNumber"`
@@ -221,8 +235,8 @@ type FlashbotsSendResponse struct {
 // #############################################################################
 
 func main() {
-	log.Println("🚀 Flashbots Atomic Uniswap V2 Operations")
-	log.Println("==========================================")
+	log.Println("🚀 Flashbots Atomic Uniswap V2 Operations (Dynamic Gas)")
+	log.Println("====================================================")
 
 	// Parse configuration
 	config, err := parseConfig()
@@ -231,8 +245,8 @@ func main() {
 	}
 
 	// Validate keys
-	if config.EoaPrivateKey == "YOUR_EOA_PRIVATE_KEY" || 
-	   config.FlashbotsSignerKey == "YOUR_FLASHBOTS_SIGNER_KEY" {
+	if config.EoaPrivateKey == "YOUR_EOA_PRIVATE_KEY" ||
+		config.FlashbotsSignerKey == "YOUR_FLASHBOTS_SIGNER_KEY" {
 		log.Println("❌ Please set your actual private keys!")
 		log.Println("Usage examples:")
 		log.Println("  go run main.go --eoa-key=0x123... --flashbots-key=0x456...")
@@ -273,17 +287,21 @@ func main() {
 		log.Fatalf("Failed to get nonce: %v", err)
 	}
 
-	gasPrice, err := client.SuggestGasPrice(ctx)
+	// Calculate dynamic gas parameters
+	gasParams, err := calculateDynamicGasParams(ctx, client)
 	if err != nil {
-		log.Fatalf("Failed to get gas price: %v", err)
+		log.Fatalf("Failed to calculate gas parameters: %v", err)
 	}
 
-	// Increase gas price by 20% for faster inclusion
-	gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(120))
-	gasPrice = new(big.Int).Div(gasPrice, big.NewInt(100))
+	if gasParams.IsLegacy {
+		log.Printf("⛽ Using legacy gas: %s Gwei", weiToGwei(gasParams.LegacyGasPrice).Text('f', 2))
+	} else {
+		log.Printf("⛽ Using EIP-1559: MaxFee=%s Gwei, PriorityFee=%s Gwei",
+			weiToGwei(gasParams.MaxFeePerGas).Text('f', 2),
+			weiToGwei(gasParams.MaxPriorityFee).Text('f', 2))
+	}
 
-	log.Printf("Chain ID: %s, Nonce: %d, Gas Price: %s Gwei", 
-		chainID.String(), nonce, weiToGwei(gasPrice).Text('f', 2))
+	log.Printf("Chain ID: %s, Nonce: %d", chainID.String(), nonce)
 
 	// Display transaction plan
 	ethFloat := new(big.Float).Quo(new(big.Float).SetInt(config.EthAmount), big.NewFloat(params.Ether))
@@ -293,7 +311,7 @@ func main() {
 	log.Printf("   • Slippage tolerance: %.2f%%", config.SlippageTolerance*100)
 
 	// Execute atomic operations
-	if err := executeAtomicOperations(ctx, client, config, eoaKey, flashbotsKey, chainID, nonce, gasPrice); err != nil {
+	if err := executeAtomicOperations(ctx, client, config, eoaKey, flashbotsKey, chainID, nonce, gasParams); err != nil {
 		log.Fatalf("Execution failed: %v", err)
 	}
 
@@ -304,135 +322,383 @@ func main() {
 // ##                        MAIN EXECUTION LOGIC                             ##
 // #############################################################################
 
-func executeAtomicOperations(ctx context.Context, client *ethclient.Client, config *Config, eoaKey, flashbotsKey *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasPrice *big.Int) error {
+// func executeAtomicOperations(ctx context.Context, client *ethclient.Client, config *Config, eoaKey, flashbotsKey *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasParams *GasParams) error {
+// 	eoaAddress := crypto.PubkeyToAddress(eoaKey.PublicKey)
+// 	deadline := big.NewInt(time.Now().Unix() + config.DeadlineSeconds)
+
+// 	// Parse ABIs
+// 	routerContractABI, err := abi.JSON(strings.NewReader(routerABI))
+// 	if err != nil {
+// 		return fmt.Errorf("failed to parse router ABI: %v", err)
+// 	}
+
+// 	erc20ContractABI, err := abi.JSON(strings.NewReader(erc20ABI))
+// 	if err != nil {
+// 		return fmt.Errorf("failed to parse ERC20 ABI: %v", err)
+// 	}
+
+// 	// 1. Get expected token amount from swap
+// 	log.Println("\n[1/5] Calculating expected token output...")
+// 	path := []common.Address{common.HexToAddress(WETH_ADDRESS), config.TokenAddress}
+// 	expectedTokenAmount, err := getAmountsOut(ctx, client, &routerContractABI, config.EthAmount, path)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to get expected token amount: %v", err)
+// 	}
+// 	log.Printf("Expected token output: %s", formatTokenAmount(expectedTokenAmount, 6))
+
+// 	// 2. Create token approval transaction
+// 	log.Println("\n[2/5] Creating token approval transaction...")
+// 	approveTx, err := createApproveTransaction(ctx, client, eoaKey, chainID, nonce, gasParams, config.TokenAddress, expectedTokenAmount, &erc20ContractABI)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create approve transaction: %v", err)
+// 	}
+// 	log.Printf("Approve TX hash: %s (Gas: %d)", approveTx.Hash().Hex(), approveTx.Gas())
+
+// 	// 3. Create swap transaction
+// 	log.Println("\n[3/5] Creating swap transaction...")
+// 	amountOutMin := applySlippage(expectedTokenAmount, config.SlippageTolerance)
+// 	swapTx, err := createSwapTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+1, gasParams, deadline, config.EthAmount, amountOutMin, path, &routerContractABI)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create swap transaction: %v", err)
+// 	}
+// 	log.Printf("Swap TX hash: %s (Gas: %d)", swapTx.Hash().Hex(), swapTx.Gas())
+
+// 	// 4. Create add liquidity transaction
+// 	log.Println("\n[4/5] Creating add liquidity transaction...")
+// 	ethForLP, err := calculateOptimalETHForLP(ctx, client, config.TokenAddress, expectedTokenAmount)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to calculate optimal ETH for LP: %v", err)
+// 	}
+
+// 	addLiquidityTx, err := createAddLiquidityTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+2, gasParams, deadline, config.TokenAddress, expectedTokenAmount, ethForLP, config.SlippageTolerance, &routerContractABI)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create add liquidity transaction: %v", err)
+// 	}
+// 	log.Printf("AddLiquidity TX hash: %s (Gas: %d)", addLiquidityTx.Hash().Hex(), addLiquidityTx.Gas())
+
+// 	// 5. Bundle and send via Flashbots
+// 	log.Println("\n[5/5] Bundling and sending to Flashbots...")
+// 	transactions := []*types.Transaction{approveTx, swapTx, addLiquidityTx}
+
+// 	// Calculate total gas fees
+// 	totalGasUsed := approveTx.Gas() + swapTx.Gas() + addLiquidityTx.Gas()
+// 	var totalFees *big.Int
+// 	if gasParams.IsLegacy {
+// 		totalFees = new(big.Int).Mul(gasParams.LegacyGasPrice, new(big.Int).SetUint64(totalGasUsed))
+// 	} else {
+// 		totalFees = new(big.Int).Mul(gasParams.MaxFeePerGas, new(big.Int).SetUint64(totalGasUsed))
+// 	}
+// 	log.Printf("📊 Bundle Stats: Total Gas=%d, Est. Fees=~%s ETH", totalGasUsed, weiToEth(totalFees.String()))
+
+// 	// Simulate bundle first
+// 	simResult, err := simulateBundle(ctx, transactions, flashbotsKey)
+// 	if err != nil {
+// 		log.Printf("⚠️  Bundle simulation failed: %v", err)
+// 	} else {
+// 		log.Println("✅ Bundle simulation successful!")
+// 		for i, result := range simResult.Result.Results {
+// 			if result.Error != "" {
+// 				return fmt.Errorf("transaction %d simulation error: %s", i+1, result.Error)
+// 			}
+// 			log.Printf("   TX %d: Gas used %s, Gas fees %s ETH", i+1, result.GasUsed, weiToEth(result.GasFees))
+// 		}
+// 	}
+
+// 	// Send bundle with retries for better inclusion chance
+// 	sendResult, err := sendBundleWithRetries(ctx, transactions, flashbotsKey, 3)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to send bundle: %v", err)
+// 	}
+
+// 	log.Printf("🎯 Bundle submitted! Hash: %s", sendResult.Result.BundleHash)
+
+// 	// Monitor for inclusion with faster polling
+// 	return monitorBundleInclusion(ctx, client, transactions, 60*time.Second)
+// }
+
+func executeAtomicOperations(ctx context.Context, client *ethclient.Client, config *Config, eoaKey, flashbotsKey *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasParams *GasParams) error {
 	eoaAddress := crypto.PubkeyToAddress(eoaKey.PublicKey)
 	deadline := big.NewInt(time.Now().Unix() + config.DeadlineSeconds)
 
-	// Parse router ABI
+	// Parse ABIs
 	routerContractABI, err := abi.JSON(strings.NewReader(routerABI))
 	if err != nil {
 		return fmt.Errorf("failed to parse router ABI: %v", err)
 	}
 
-	// Parse ERC20 ABI
 	erc20ContractABI, err := abi.JSON(strings.NewReader(erc20ABI))
 	if err != nil {
 		return fmt.Errorf("failed to parse ERC20 ABI: %v", err)
 	}
 
-	// 1. Get expected token amount from swap
+	// ✅ Split initial ETH: 50% for swap, 50% for liquidity
+	two := big.NewInt(2)
+	ethForSwap := new(big.Int).Div(config.EthAmount, two)
+	// Use the remaining ETH for LP to avoid dust from division
+	ethForLP := new(big.Int).Sub(config.EthAmount, ethForSwap)
+
+	// 1. Calculate token output from swapping HALF the ETH
 	log.Println("\n[1/5] Calculating expected token output...")
 	path := []common.Address{common.HexToAddress(WETH_ADDRESS), config.TokenAddress}
-	expectedTokenAmount, err := getAmountsOut(ctx, client, &routerContractABI, config.EthAmount, path)
+	expectedTokenAmount, err := getAmountsOut(ctx, client, &routerContractABI, ethForSwap, path)
 	if err != nil {
 		return fmt.Errorf("failed to get expected token amount: %v", err)
 	}
-	log.Printf("Expected token output: %s", formatTokenAmount(expectedTokenAmount, 18))
-
-	log.Printf("Expected token output: %s", formatTokenAmount(expectedTokenAmount, 6)) 
-
+	log.Printf("Expected token output: %s", formatTokenAmount(expectedTokenAmount, 6))
 
 	// 2. Create token approval transaction
 	log.Println("\n[2/5] Creating token approval transaction...")
-	approveTx, err := createApproveTransaction(eoaKey, chainID, nonce, gasPrice, config.TokenAddress, expectedTokenAmount, &erc20ContractABI)
+	approveTx, err := createApproveTransaction(ctx, client, eoaKey, chainID, nonce, gasParams, config.TokenAddress, expectedTokenAmount, &erc20ContractABI)
 	if err != nil {
 		return fmt.Errorf("failed to create approve transaction: %v", err)
 	}
-	log.Printf("Approve TX hash: %s", approveTx.Hash().Hex())
+	log.Printf("Approve TX hash: %s (Gas: %d)", approveTx.Hash().Hex(), approveTx.Gas())
 
-	// 3. Create swap transaction
+	// 3. Create swap transaction with ethForSwap
 	log.Println("\n[3/5] Creating swap transaction...")
 	amountOutMin := applySlippage(expectedTokenAmount, config.SlippageTolerance)
-	swapTx, err := createSwapTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+1, gasPrice, deadline, config.EthAmount, amountOutMin, path, &routerContractABI)
+	swapTx, err := createSwapTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+1, gasParams, deadline, ethForSwap, amountOutMin, path, &routerContractABI)
 	if err != nil {
 		return fmt.Errorf("failed to create swap transaction: %v", err)
 	}
-	log.Printf("Swap TX hash: %s", swapTx.Hash().Hex())
+	log.Printf("Swap TX hash: %s (Gas: %d)", swapTx.Hash().Hex(), swapTx.Gas())
 
-	// 4. Create add liquidity transaction
+	// 4. Create add liquidity transaction with ethForLP
 	log.Println("\n[4/5] Creating add liquidity transaction...")
-	ethForLP, err := calculateOptimalETHForLP(ctx, client, config.TokenAddress, expectedTokenAmount)
-	if err != nil {
-		return fmt.Errorf("failed to calculate optimal ETH for LP: %v", err)
-	}
-
-	addLiquidityTx, err := createAddLiquidityTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+2, gasPrice, deadline, config.TokenAddress, expectedTokenAmount, ethForLP, config.SlippageTolerance, &routerContractABI)
+	addLiquidityTx, err := createAddLiquidityTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+2, gasParams, deadline, config.TokenAddress, expectedTokenAmount, ethForLP, config.SlippageTolerance, &routerContractABI)
 	if err != nil {
 		return fmt.Errorf("failed to create add liquidity transaction: %v", err)
 	}
-	log.Printf("AddLiquidity TX hash: %s", addLiquidityTx.Hash().Hex())
+	log.Printf("AddLiquidity TX hash: %s (Gas: %d)", addLiquidityTx.Hash().Hex(), addLiquidityTx.Gas())
 
 	// 5. Bundle and send via Flashbots
 	log.Println("\n[5/5] Bundling and sending to Flashbots...")
 	transactions := []*types.Transaction{approveTx, swapTx, addLiquidityTx}
 
+	// Calculate total gas fees
+	totalGasUsed := approveTx.Gas() + swapTx.Gas() + addLiquidityTx.Gas()
+	var totalFees *big.Int
+	if gasParams.IsLegacy {
+		totalFees = new(big.Int).Mul(gasParams.LegacyGasPrice, new(big.Int).SetUint64(totalGasUsed))
+	} else {
+		totalFees = new(big.Int).Mul(gasParams.MaxFeePerGas, new(big.Int).SetUint64(totalGasUsed))
+	}
+	log.Printf("📊 Bundle Stats: Total Gas=%d, Est. Fees=~%s ETH", totalGasUsed, weiToEth(totalFees.String()))
+
 	// Simulate bundle first
 	simResult, err := simulateBundle(ctx, transactions, flashbotsKey)
 	if err != nil {
 		log.Printf("⚠️  Bundle simulation failed: %v", err)
+	} else if simResult.Error != nil {
+		return fmt.Errorf("bundle simulation returned an error: %s", simResult.Error.Message)
 	} else {
 		log.Println("✅ Bundle simulation successful!")
 		for i, result := range simResult.Result.Results {
 			if result.Error != "" {
-				return fmt.Errorf("transaction %d simulation error: %s", i+1, result.Error)
+				return fmt.Errorf("transaction %d simulation error: %s - %s", i+1, result.Error, result.Revert)
 			}
 			log.Printf("   TX %d: Gas used %s, Gas fees %s ETH", i+1, result.GasUsed, weiToEth(result.GasFees))
 		}
 	}
 
-	// Send bundle
-	sendResult, err := sendBundle(ctx, transactions, flashbotsKey)
+	// Send bundle with retries for better inclusion chance
+	sendResult, err := sendBundleWithRetries(ctx, transactions, flashbotsKey, 3)
 	if err != nil {
 		return fmt.Errorf("failed to send bundle: %v", err)
 	}
 
 	log.Printf("🎯 Bundle submitted! Hash: %s", sendResult.Result.BundleHash)
 
-	// Monitor for inclusion
-	return monitorBundleInclusion(ctx, client, transactions, 30*time.Second)
+	// Monitor for inclusion with faster polling
+	return monitorBundleInclusion(ctx, client, transactions, 60*time.Second)
+}
+
+// #############################################################################
+// ##                        DYNAMIC GAS CALCULATION                          ##
+// #############################################################################
+
+func calculateDynamicGasParams(ctx context.Context, client *ethclient.Client) (*GasParams, error) {
+	// Get latest block header
+	header, err := client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest block header: %v", err)
+	}
+
+	// Check if EIP-1559 is active
+	if header.BaseFee == nil {
+		// Legacy gas pricing
+		gasPrice, err := client.SuggestGasPrice(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get legacy gas price: %v", err)
+		}
+
+		// Increase by 50% for faster inclusion
+		fastGasPrice := new(big.Int).Mul(gasPrice, big.NewInt(150))
+		fastGasPrice = new(big.Int).Div(fastGasPrice, big.NewInt(100))
+
+		return &GasParams{
+			IsLegacy:       true,
+			LegacyGasPrice: fastGasPrice,
+		}, nil
+	}
+
+	// EIP-1559 dynamic gas calculation
+	baseFee := header.BaseFee
+
+	// Get current priority fee suggestion
+	priorityFee, err := client.SuggestGasTipCap(ctx)
+	if err != nil {
+		// Fallback to minimum priority fee
+		priorityFee = gweiToWei(MIN_PRIORITY_FEE_GWEI)
+	}
+
+	// Apply multiplier for faster inclusion
+	priorityFee = new(big.Int).Mul(priorityFee, big.NewInt(int64(PRIORITY_FEE_MULTIPLIER*100)))
+	priorityFee = new(big.Int).Div(priorityFee, big.NewInt(100))
+
+	// Enforce min/max bounds
+	minPriorityFee := gweiToWei(MIN_PRIORITY_FEE_GWEI)
+	maxPriorityFee := gweiToWei(MAX_PRIORITY_FEE_GWEI)
+
+	if priorityFee.Cmp(minPriorityFee) < 0 {
+		priorityFee = minPriorityFee
+	}
+	if priorityFee.Cmp(maxPriorityFee) > 0 {
+		priorityFee = maxPriorityFee
+	}
+
+	// Calculate maxFeePerGas = (baseFee * multiplier) + priorityFee
+	maxBaseFee := new(big.Float).Mul(new(big.Float).SetInt(baseFee), big.NewFloat(BASE_FEE_MULTIPLIER))
+	maxBaseFeeInt, _ := maxBaseFee.Int(nil)
+	maxFeePerGas := new(big.Int).Add(maxBaseFeeInt, priorityFee)
+
+	log.Printf("🔥 Gas Market Analysis:")
+	log.Printf("   • Current Base Fee: %s Gwei", weiToGwei(baseFee).Text('f', 2))
+	log.Printf("   • Dynamic Priority Fee: %s Gwei", weiToGwei(priorityFee).Text('f', 2))
+	log.Printf("   • Max Fee Per Gas: %s Gwei", weiToGwei(maxFeePerGas).Text('f', 2))
+
+	return &GasParams{
+		MaxFeePerGas:   maxFeePerGas,
+		MaxPriorityFee: priorityFee,
+		IsLegacy:       false,
+	}, nil
+}
+
+func estimateGasWithRetry(ctx context.Context, client *ethclient.Client, msg ethereum.CallMsg, retries int) (uint64, error) {
+	var lastErr error
+
+	for i := 0; i < retries; i++ {
+		gasLimit, err := client.EstimateGas(ctx, msg)
+		if err == nil {
+			// Add buffer to prevent out-of-gas errors
+			bufferedGas := gasLimit * (100 + GAS_LIMIT_BUFFER_PERCENT) / 100
+			return bufferedGas, nil
+		}
+
+		lastErr = err
+		if i < retries-1 {
+			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+		}
+	}
+
+	return 0, fmt.Errorf("gas estimation failed after %d retries: %v", retries, lastErr)
+}
+
+func getDefaultGasLimits(operation string) uint64 {
+	switch operation {
+	case "approve":
+		return 60000
+	case "swap":
+		return 300000
+	case "addLiquidity":
+		return 400000
+	default:
+		return 200000
+	}
 }
 
 // #############################################################################
 // ##                        TRANSACTION CREATION                             ##
 // #############################################################################
 
-func createApproveTransaction(key *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasPrice *big.Int, tokenAddr common.Address, amount *big.Int, erc20ABI *abi.ABI) (*types.Transaction, error) {
+func createApproveTransaction(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasParams *GasParams, tokenAddr common.Address, amount *big.Int, erc20ABI *abi.ABI) (*types.Transaction, error) {
 	data, err := erc20ABI.Pack("approve", common.HexToAddress(UNISWAP_V2_ROUTER_ADDR), amount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack approve data: %v", err)
 	}
 
-	tx := types.NewTransaction(nonce, tokenAddr, big.NewInt(0), 100000, gasPrice, data)
-	return types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	// Estimate gas
+	gasLimit, err := estimateGasWithRetry(ctx, client, ethereum.CallMsg{
+		From: crypto.PubkeyToAddress(key.PublicKey),
+		To:   &tokenAddr,
+		Data: data,
+	}, 3)
+	if err != nil {
+		log.Printf("⚠️  Using default gas limit for approve: %v", err)
+		gasLimit = getDefaultGasLimits("approve")
+		gasLimit = gasLimit * (100 + GAS_LIMIT_BUFFER_PERCENT) / 100
+	}
+
+	// Create transaction based on gas type
+	if gasParams.IsLegacy {
+		tx := types.NewTransaction(nonce, tokenAddr, big.NewInt(0), gasLimit, gasParams.LegacyGasPrice, data)
+		return types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	} else {
+		tx := types.NewTx(&types.DynamicFeeTx{
+			ChainID:   chainID,
+			Nonce:     nonce,
+			GasTipCap: gasParams.MaxPriorityFee,
+			GasFeeCap: gasParams.MaxFeePerGas,
+			Gas:       gasLimit,
+			To:        &tokenAddr,
+			Value:     big.NewInt(0),
+			Data:      data,
+		})
+		return types.SignTx(tx, types.NewLondonSigner(chainID), key)
+	}
 }
 
-func createSwapTransaction(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, to common.Address, nonce uint64, gasPrice, deadline, value, amountOutMin *big.Int, path []common.Address, routerABI *abi.ABI) (*types.Transaction, error) {
+func createSwapTransaction(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, to common.Address, nonce uint64, gasParams *GasParams, deadline, value, amountOutMin *big.Int, path []common.Address, routerABI *abi.ABI) (*types.Transaction, error) {
 	data, err := routerABI.Pack("swapExactETHForTokens", amountOutMin, path, to, deadline)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack swap data: %v", err)
 	}
 
-	// Estimate gas
 	routerAddr := common.HexToAddress(UNISWAP_V2_ROUTER_ADDR)
-	// gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{
-	// 	From:  to,
-	// 	To:    &routerAddr,
-	// 	Value: value,
-	// 	Data:  data,
-	// })
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to estimate gas: %v", err)
-	// }
-	gasLimit := uint64(334_000_000)
 
-	// Add 20% buffer
-	gasLimit = gasLimit * 120 / 100
+	// Estimate gas
+	gasLimit, err := estimateGasWithRetry(ctx, client, ethereum.CallMsg{
+		From:  to,
+		To:    &routerAddr,
+		Value: value,
+		Data:  data,
+	}, 3)
+	if err != nil {
+		log.Printf("⚠️  Using default gas limit for swap: %v", err)
+		gasLimit = getDefaultGasLimits("swap")
+		gasLimit = gasLimit * (100 + GAS_LIMIT_BUFFER_PERCENT) / 100
+	}
 
-	tx := types.NewTransaction(nonce, routerAddr, value, gasLimit, gasPrice, data)
-	return types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	// Create transaction based on gas type
+	if gasParams.IsLegacy {
+		tx := types.NewTransaction(nonce, routerAddr, value, gasLimit, gasParams.LegacyGasPrice, data)
+		return types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	} else {
+		tx := types.NewTx(&types.DynamicFeeTx{
+			ChainID:   chainID,
+			Nonce:     nonce,
+			GasTipCap: gasParams.MaxPriorityFee,
+			GasFeeCap: gasParams.MaxFeePerGas,
+			Gas:       gasLimit,
+			To:        &routerAddr,
+			Value:     value,
+			Data:      data,
+		})
+		return types.SignTx(tx, types.NewLondonSigner(chainID), key)
+	}
 }
 
-func createAddLiquidityTransaction(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, to common.Address, nonce uint64, gasPrice, deadline *big.Int, tokenAddr common.Address, tokenAmount, ethAmount *big.Int, slippage float64, routerABI *abi.ABI) (*types.Transaction, error) {
+func createAddLiquidityTransaction(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, to common.Address, nonce uint64, gasParams *GasParams, deadline *big.Int, tokenAddr common.Address, tokenAmount, ethAmount *big.Int, slippage float64, routerABI *abi.ABI) (*types.Transaction, error) {
 	amountTokenMin := applySlippage(tokenAmount, slippage)
 	amountETHMin := applySlippage(ethAmount, slippage)
 
@@ -441,24 +707,38 @@ func createAddLiquidityTransaction(ctx context.Context, client *ethclient.Client
 		return nil, fmt.Errorf("failed to pack add liquidity data: %v", err)
 	}
 
-	// Estimate gas
 	routerAddr := common.HexToAddress(UNISWAP_V2_ROUTER_ADDR)
-	// gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{
-	// 	From:  to,
-	// 	To:    &routerAddr,
-	// 	Value: ethAmount,
-	// 	Data:  data,
-	// })
-	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to estimate gas: %v", err)
-	// }
-	gasLimit := uint64(334_000_000) // Set a fixed gas limit for addLiquidity
 
-	// Add 20% buffer
-	gasLimit = gasLimit * 120 / 100
+	// Estimate gas
+	gasLimit, err := estimateGasWithRetry(ctx, client, ethereum.CallMsg{
+		From:  to,
+		To:    &routerAddr,
+		Value: ethAmount,
+		Data:  data,
+	}, 3)
+	if err != nil {
+		log.Printf("⚠️  Using default gas limit for addLiquidity: %v", err)
+		gasLimit = getDefaultGasLimits("addLiquidity")
+		gasLimit = gasLimit * (100 + GAS_LIMIT_BUFFER_PERCENT) / 100
+	}
 
-	tx := types.NewTransaction(nonce, routerAddr, ethAmount, gasLimit, gasPrice, data)
-	return types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	// Create transaction based on gas type
+	if gasParams.IsLegacy {
+		tx := types.NewTransaction(nonce, routerAddr, ethAmount, gasLimit, gasParams.LegacyGasPrice, data)
+		return types.SignTx(tx, types.NewEIP155Signer(chainID), key)
+	} else {
+		tx := types.NewTx(&types.DynamicFeeTx{
+			ChainID:   chainID,
+			Nonce:     nonce,
+			GasTipCap: gasParams.MaxPriorityFee,
+			GasFeeCap: gasParams.MaxFeePerGas,
+			Gas:       gasLimit,
+			To:        &routerAddr,
+			Value:     ethAmount,
+			Data:      data,
+		})
+		return types.SignTx(tx, types.NewLondonSigner(chainID), key)
+	}
 }
 
 // #############################################################################
@@ -468,11 +748,18 @@ func createAddLiquidityTransaction(ctx context.Context, client *ethclient.Client
 func simulateBundle(ctx context.Context, txs []*types.Transaction, authKey *ecdsa.PrivateKey) (*FlashbotsSimulationResponse, error) {
 	// Encode transactions
 	var txsHex []string
-	for _, tx := range txs {
-		rawTx, err := rlp.EncodeToBytes(tx)
+	for i, tx := range txs {
+		rawTx, err := tx.MarshalBinary()
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode transaction: %v", err)
 		}
+		log.Printf("TX %d len=%d firstByte=%#x", i+1, len(rawTx), rawTx[0])
+
+		var chk types.Transaction
+		if err := chk.UnmarshalBinary(rawTx); err != nil {
+			log.Fatalf("local decode failed: %v", err)
+		}
+
 		txsHex = append(txsHex, hexutil.Encode(rawTx))
 	}
 
@@ -504,12 +791,20 @@ func simulateBundle(ctx context.Context, txs []*types.Transaction, authKey *ecds
 func sendBundle(ctx context.Context, txs []*types.Transaction, authKey *ecdsa.PrivateKey) (*FlashbotsSendResponse, error) {
 	// Encode transactions
 	var txsHex []string
-	for _, tx := range txs {
-		rawTx, err := rlp.EncodeToBytes(tx)
+	for i, tx := range txs {
+		rawTx, err := tx.MarshalBinary()
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode transaction: %v", err)
 		}
+
+		log.Printf("TX %d len=%d firstByte=%#x", i+1, len(rawTx), rawTx[0])
+
 		txsHex = append(txsHex, hexutil.Encode(rawTx))
+
+		var chk types.Transaction
+		if err := chk.UnmarshalBinary(rawTx); err != nil {
+			log.Fatalf("local decode failed: %v", err)
+		}
 	}
 
 	// Get target block
@@ -534,6 +829,33 @@ func sendBundle(ctx context.Context, txs []*types.Transaction, authKey *ecdsa.Pr
 	}
 
 	return sendFlashbotsRequest[FlashbotsSendResponse](ctx, request, authKey)
+}
+
+func sendBundleWithRetries(ctx context.Context, txs []*types.Transaction, authKey *ecdsa.PrivateKey, maxRetries int) (*FlashbotsSendResponse, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		result, err := sendBundle(ctx, txs, authKey)
+		if err == nil && result.Error == nil {
+			if attempt > 1 {
+				log.Printf("✅ Bundle sent successfully on attempt %d", attempt)
+			}
+			return result, nil
+		}
+
+		if result != nil && result.Error != nil {
+			lastErr = fmt.Errorf("flashbots error: %s", result.Error.Message)
+		} else {
+			lastErr = err
+		}
+
+		if attempt < maxRetries {
+			log.Printf("🔄 Bundle send attempt %d failed, retrying: %v", attempt, lastErr)
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+
+	return nil, fmt.Errorf("failed to send bundle after %d attempts: %v", maxRetries, lastErr)
 }
 
 func sendFlashbotsRequest[T any](ctx context.Context, request FlashbotsRequest, authKey *ecdsa.PrivateKey) (*T, error) {
@@ -580,15 +902,42 @@ func sendFlashbotsRequest[T any](ctx context.Context, request FlashbotsRequest, 
 	return &result, nil
 }
 
+// func signFlashbotsPayload(body []byte, key *ecdsa.PrivateKey) (string, error) {
+// 	hash := crypto.Keccak256Hash(body)
+// 	signature, err := crypto.Sign(hash.Bytes(), key)
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to sign: %v", err)
+// 	}
+
+// 	signature[64] += 27
+
+// 	address := crypto.PubkeyToAddress(key.PublicKey)
+// 	fmt.Println("📌 Flashbots signer address used:", address.Hex())
+
+// 	return fmt.Sprintf("%s:0x%s", address.Hex(), hex.EncodeToString(signature)), nil
+// }
+
 func signFlashbotsPayload(body []byte, key *ecdsa.PrivateKey) (string, error) {
-	hash := crypto.Keccak256Hash(body)
-	signature, err := crypto.Sign(hash.Bytes(), key)
+	// 1) Keccak-256 روی بدنهٔ خام
+	rawHash := crypto.Keccak256(body)
+
+	// 2) هَش را به رشتهٔ هگز (با 0x) تبدیل کنید
+	hexHash := []byte(hexutil.Encode(rawHash))
+
+	// 3) هش شخصی‌شدهٔ EIP-191
+	prefixedHash := accounts.TextHash(hexHash)
+
+	// 4) امضا
+	sig, err := crypto.Sign(prefixedHash, key)
 	if err != nil {
-		return "", fmt.Errorf("failed to sign: %v", err)
+		return "", fmt.Errorf("sign error: %w", err)
+	}
+	if sig[64] < 27 { // هماهنگ با go-ethereum
+		sig[64] += 27
 	}
 
-	address := crypto.PubkeyToAddress(key.PublicKey)
-	return fmt.Sprintf("%s:0x%s", address.Hex(), hex.EncodeToString(signature)), nil
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	return fmt.Sprintf("%s:%s", addr.Hex(), hexutil.Encode(sig)), nil
 }
 
 // #############################################################################
@@ -790,6 +1139,13 @@ func weiToGwei(wei *big.Int) *big.Float {
 	return new(big.Float).Quo(new(big.Float).SetInt(wei), big.NewFloat(params.GWei))
 }
 
+func gweiToWei(gwei float64) *big.Int {
+	gweiFloat := big.NewFloat(gwei)
+	weiFloat := new(big.Float).Mul(gweiFloat, big.NewFloat(params.GWei))
+	wei, _ := weiFloat.Int(nil)
+	return wei
+}
+
 func weiToEth(weiStr string) string {
 	wei, ok := new(big.Int).SetString(weiStr, 10)
 	if !ok {
@@ -806,10 +1162,10 @@ func formatTokenAmount(amount *big.Int, decimals int) string {
 }
 
 func monitorBundleInclusion(ctx context.Context, client *ethclient.Client, txs []*types.Transaction, timeout time.Duration) error {
-	log.Printf("⏳ Monitoring bundle inclusion (timeout: %v)...", timeout)
-	
+	log.Printf("⏳ Monitoring bundle inclusion with fast polling (timeout: %v)...", timeout)
+
 	startTime := time.Now()
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(1 * time.Second) // Faster polling for quicker detection
 	defer ticker.Stop()
 
 	txHashes := make([]common.Hash, len(txs))
@@ -817,33 +1173,45 @@ func monitorBundleInclusion(ctx context.Context, client *ethclient.Client, txs [
 		txHashes[i] = tx.Hash()
 	}
 
+	includedCount := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(timeout):
-			return fmt.Errorf("bundle inclusion timeout after %v", timeout)
+			return fmt.Errorf("bundle inclusion timeout after %v (included: %d/%d)", timeout, includedCount, len(txHashes))
 		case <-ticker.C:
 			// Check if any transaction is included
+			newlyIncluded := 0
 			for i, txHash := range txHashes {
 				receipt, err := client.TransactionReceipt(ctx, txHash)
-				if err == nil && receipt != nil {
-					log.Printf("✅ Transaction %d included in block %d", i+1, receipt.BlockNumber.Uint64())
-					if i == len(txHashes)-1 {
-						log.Printf("🎉 All transactions included! Total time: %v", time.Since(startTime))
-						return nil
+				if err == nil && receipt != nil && receipt.Status == 1 {
+					if includedCount <= i {
+						log.Printf("✅ Transaction %d included in block %d (status: success)", i+1, receipt.BlockNumber.Uint64())
+						newlyIncluded++
+					}
+					if i+1 > includedCount {
+						includedCount = i + 1
 					}
 				}
 			}
 
-			// Log progress
+			// Check if all transactions are included
+			if includedCount == len(txHashes) {
+				log.Printf("🎉 All transactions confirmed! Total time: %v", time.Since(startTime).Truncate(time.Millisecond))
+				return nil
+			}
+
+			// Log progress every 5 seconds
 			elapsed := time.Since(startTime)
-			log.Printf("⏱️  Still monitoring... elapsed: %v", elapsed.Truncate(time.Second))
+			if elapsed.Truncate(time.Second).Seconds() > 0 && int(elapsed.Seconds())%5 == 0 {
+				log.Printf("⏱️  Monitoring... elapsed: %v, included: %d/%d", elapsed.Truncate(time.Second), includedCount, len(txHashes))
+			}
 		}
 	}
 }
 
 func init() {
-	// Set up logging
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// Set up logging with timestamps
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
