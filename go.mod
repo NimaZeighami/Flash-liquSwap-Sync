@@ -1,4 +1,4 @@
-module github.com/NimaZeighami/Flash-liquSwap-Sync
+module github.com/nimazeighami/flash-liquswap-sync
 
 go 1.24.3
 

@@ -26,11 +26,20 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
-// #############################################################################
-// ##                           CONFIGURATION                                 ##
-// #############################################################################
+
+// ##### CONFIGURATION
 
 const (
+	// ----------------  Testnet Configuration ---------------- \\
+	// RPC_URL             = "https://rpc.sepolia.org"	// testnet
+	// FLASHBOTS_RELAY_URL = "https://relay-sepolia.flashbots.net"
+	// UNISWAP_V2_ROUTER_ADDR = "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3" // Sepolia Uniswap V2 Router
+	// WETH_ADDRESS           = "0xDD13E55209Fd76AfE204dBda4007C227904f0a81" // Sepolia WETH
+	// DEFAULT_TOKEN_ADDRESS    = "0x65aFADD39029741B3b8f0756952C74678c9cEC93" // usdc
+
+
+	// ----------------  Mainnet Configuration ---------------- \\
+
 	// -- Endpoints --
 	RPC_URL             = "https://eth.llamarpc.com"
 	FLASHBOTS_RELAY_URL = "https://relay.flashbots.net"
@@ -40,9 +49,9 @@ const (
 	WETH_ADDRESS           = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 
 	// -- Default Parameters --
-	DEFAULT_ETH_AMOUNT       = "0.012" // ETH to swap
-	DEFAULT_TOKEN_ADDRESS    = "0xF7285d17dded63A4480A0f1F0a8cc706F02dDa0a"
-	DEFAULT_SLIPPAGE         = 0.01 // 1%
+	DEFAULT_TOKEN_ADDRESS    = "0x6B175474E89094C44Da98b954EedeAC495271d0F" // DAI Contract address
+	DEFAULT_ETH_AMOUNT       = "0.0005" // ETH to swap
+	DEFAULT_SLIPPAGE         = 0.005 // 1%
 	DEFAULT_DEADLINE_SECONDS = 120  // 2 minutes
 
 	// -- Dynamic Gas Parameters --
@@ -104,41 +113,6 @@ const (
 			"type": "function"
 		}
 	]`
-
-	factoryABI = `[
-		{
-			"inputs": [
-				{"internalType": "address", "name": "tokenA", "type": "address"},
-				{"internalType": "address", "name": "tokenB", "type": "address"}
-			],
-			"name": "getPair",
-			"outputs": [{"internalType": "address", "name": "pair", "type": "address"}],
-			"stateMutability": "view",
-			"type": "function"
-		}
-	]`
-
-	pairABI = `[
-		{
-			"inputs": [],
-			"name": "getReserves",
-			"outputs": [
-				{"internalType": "uint112", "name": "_reserve0", "type": "uint112"},
-				{"internalType": "uint112", "name": "_reserve1", "type": "uint112"},
-				{"internalType": "uint32", "name": "_blockTimestampLast", "type": "uint32"}
-			],
-			"stateMutability": "view",
-			"type": "function"
-		},
-		{
-			"inputs": [],
-			"name": "token0",
-			"outputs": [{"internalType": "address", "name": "", "type": "address"}],
-			"stateMutability": "view",
-			"type": "function"
-		}
-	]`
-
 	erc20ABI = `[
 		{
 			"inputs": [
@@ -153,9 +127,7 @@ const (
 	]`
 )
 
-// #############################################################################
-// ##                            STRUCTURES                                   ##
-// #############################################################################
+// ##### STRUCTURES
 
 type Config struct {
 	RpcURL             string
@@ -230,9 +202,8 @@ type FlashbotsSendResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// #############################################################################
-// ##                           MAIN EXECUTION                                ##
-// #############################################################################
+
+// ##### MAIN FUNCTION
 
 func main() {
 	log.Println("🚀 Flashbots Atomic Uniswap V2 Operations (Dynamic Gas)")
@@ -318,104 +289,7 @@ func main() {
 	log.Println("🎉 Atomic operations completed successfully!")
 }
 
-// #############################################################################
-// ##                        MAIN EXECUTION LOGIC                             ##
-// #############################################################################
-
-// func executeAtomicOperations(ctx context.Context, client *ethclient.Client, config *Config, eoaKey, flashbotsKey *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasParams *GasParams) error {
-// 	eoaAddress := crypto.PubkeyToAddress(eoaKey.PublicKey)
-// 	deadline := big.NewInt(time.Now().Unix() + config.DeadlineSeconds)
-
-// 	// Parse ABIs
-// 	routerContractABI, err := abi.JSON(strings.NewReader(routerABI))
-// 	if err != nil {
-// 		return fmt.Errorf("failed to parse router ABI: %v", err)
-// 	}
-
-// 	erc20ContractABI, err := abi.JSON(strings.NewReader(erc20ABI))
-// 	if err != nil {
-// 		return fmt.Errorf("failed to parse ERC20 ABI: %v", err)
-// 	}
-
-// 	// 1. Get expected token amount from swap
-// 	log.Println("\n[1/5] Calculating expected token output...")
-// 	path := []common.Address{common.HexToAddress(WETH_ADDRESS), config.TokenAddress}
-// 	expectedTokenAmount, err := getAmountsOut(ctx, client, &routerContractABI, config.EthAmount, path)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to get expected token amount: %v", err)
-// 	}
-// 	log.Printf("Expected token output: %s", formatTokenAmount(expectedTokenAmount, 6))
-
-// 	// 2. Create token approval transaction
-// 	log.Println("\n[2/5] Creating token approval transaction...")
-// 	approveTx, err := createApproveTransaction(ctx, client, eoaKey, chainID, nonce, gasParams, config.TokenAddress, expectedTokenAmount, &erc20ContractABI)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create approve transaction: %v", err)
-// 	}
-// 	log.Printf("Approve TX hash: %s (Gas: %d)", approveTx.Hash().Hex(), approveTx.Gas())
-
-// 	// 3. Create swap transaction
-// 	log.Println("\n[3/5] Creating swap transaction...")
-// 	amountOutMin := applySlippage(expectedTokenAmount, config.SlippageTolerance)
-// 	swapTx, err := createSwapTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+1, gasParams, deadline, config.EthAmount, amountOutMin, path, &routerContractABI)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create swap transaction: %v", err)
-// 	}
-// 	log.Printf("Swap TX hash: %s (Gas: %d)", swapTx.Hash().Hex(), swapTx.Gas())
-
-// 	// 4. Create add liquidity transaction
-// 	log.Println("\n[4/5] Creating add liquidity transaction...")
-// 	ethForLP, err := calculateOptimalETHForLP(ctx, client, config.TokenAddress, expectedTokenAmount)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to calculate optimal ETH for LP: %v", err)
-// 	}
-
-// 	addLiquidityTx, err := createAddLiquidityTransaction(ctx, client, eoaKey, chainID, eoaAddress, nonce+2, gasParams, deadline, config.TokenAddress, expectedTokenAmount, ethForLP, config.SlippageTolerance, &routerContractABI)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create add liquidity transaction: %v", err)
-// 	}
-// 	log.Printf("AddLiquidity TX hash: %s (Gas: %d)", addLiquidityTx.Hash().Hex(), addLiquidityTx.Gas())
-
-// 	// 5. Bundle and send via Flashbots
-// 	log.Println("\n[5/5] Bundling and sending to Flashbots...")
-// 	transactions := []*types.Transaction{approveTx, swapTx, addLiquidityTx}
-
-// 	// Calculate total gas fees
-// 	totalGasUsed := approveTx.Gas() + swapTx.Gas() + addLiquidityTx.Gas()
-// 	var totalFees *big.Int
-// 	if gasParams.IsLegacy {
-// 		totalFees = new(big.Int).Mul(gasParams.LegacyGasPrice, new(big.Int).SetUint64(totalGasUsed))
-// 	} else {
-// 		totalFees = new(big.Int).Mul(gasParams.MaxFeePerGas, new(big.Int).SetUint64(totalGasUsed))
-// 	}
-// 	log.Printf("📊 Bundle Stats: Total Gas=%d, Est. Fees=~%s ETH", totalGasUsed, weiToEth(totalFees.String()))
-
-// 	// Simulate bundle first
-// 	simResult, err := simulateBundle(ctx, transactions, flashbotsKey)
-// 	if err != nil {
-// 		log.Printf("⚠️  Bundle simulation failed: %v", err)
-// 	} else {
-// 		log.Println("✅ Bundle simulation successful!")
-// 		for i, result := range simResult.Result.Results {
-// 			if result.Error != "" {
-// 				return fmt.Errorf("transaction %d simulation error: %s", i+1, result.Error)
-// 			}
-// 			log.Printf("   TX %d: Gas used %s, Gas fees %s ETH", i+1, result.GasUsed, weiToEth(result.GasFees))
-// 		}
-// 	}
-
-// 	// Send bundle with retries for better inclusion chance
-// 	sendResult, err := sendBundleWithRetries(ctx, transactions, flashbotsKey, 3)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to send bundle: %v", err)
-// 	}
-
-// 	log.Printf("🎯 Bundle submitted! Hash: %s", sendResult.Result.BundleHash)
-
-// 	// Monitor for inclusion with faster polling
-// 	return monitorBundleInclusion(ctx, client, transactions, 60*time.Second)
-// }
-
+// ##### ATOMIC EXECUTION
 func executeAtomicOperations(ctx context.Context, client *ethclient.Client, config *Config, eoaKey, flashbotsKey *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasParams *GasParams) error {
 	eoaAddress := crypto.PubkeyToAddress(eoaKey.PublicKey)
 	deadline := big.NewInt(time.Now().Unix() + config.DeadlineSeconds)
@@ -618,7 +492,7 @@ func getDefaultGasLimits(operation string) uint64 {
 }
 
 // #############################################################################
-// ##                        TRANSACTION CREATION                             ##
+// ##                        TRANSACTION CREATION                             ## --------> moved to atomic/executor.go
 // #############################################################################
 
 func createApproveTransaction(ctx context.Context, client *ethclient.Client, key *ecdsa.PrivateKey, chainID *big.Int, nonce uint64, gasParams *GasParams, tokenAddr common.Address, amount *big.Int, erc20ABI *abi.ABI) (*types.Transaction, error) {
@@ -902,20 +776,7 @@ func sendFlashbotsRequest[T any](ctx context.Context, request FlashbotsRequest, 
 	return &result, nil
 }
 
-// func signFlashbotsPayload(body []byte, key *ecdsa.PrivateKey) (string, error) {
-// 	hash := crypto.Keccak256Hash(body)
-// 	signature, err := crypto.Sign(hash.Bytes(), key)
-// 	if err != nil {
-// 		return "", fmt.Errorf("failed to sign: %v", err)
-// 	}
 
-// 	signature[64] += 27
-
-// 	address := crypto.PubkeyToAddress(key.PublicKey)
-// 	fmt.Println("📌 Flashbots signer address used:", address.Hex())
-
-// 	return fmt.Sprintf("%s:0x%s", address.Hex(), hex.EncodeToString(signature)), nil
-// }
 
 func signFlashbotsPayload(body []byte, key *ecdsa.PrivateKey) (string, error) {
 	// 1) Keccak-256 روی بدنهٔ خام
@@ -970,82 +831,6 @@ func getAmountsOut(ctx context.Context, client *ethclient.Client, routerABI *abi
 	}
 
 	return amounts[1], nil
-}
-
-func calculateOptimalETHForLP(ctx context.Context, client *ethclient.Client, tokenAddr common.Address, tokenAmount *big.Int) (*big.Int, error) {
-	// Parse ABIs
-	routerContractABI, _ := abi.JSON(strings.NewReader(routerABI))
-	factoryContractABI, _ := abi.JSON(strings.NewReader(factoryABI))
-	pairContractABI, _ := abi.JSON(strings.NewReader(pairABI))
-
-	routerAddr := common.HexToAddress(UNISWAP_V2_ROUTER_ADDR)
-	wethAddr := common.HexToAddress(WETH_ADDRESS)
-
-	// Get factory address
-	factoryData, _ := routerContractABI.Pack("factory")
-	factoryResult, err := client.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: factoryData}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get factory address: %v", err)
-	}
-	var factoryAddr common.Address
-	routerContractABI.UnpackIntoInterface(&factoryAddr, "factory", factoryResult)
-
-	// Get pair address
-	pairData, _ := factoryContractABI.Pack("getPair", tokenAddr, wethAddr)
-	pairResult, err := client.CallContract(ctx, ethereum.CallMsg{To: &factoryAddr, Data: pairData}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pair address: %v", err)
-	}
-	var pairAddr common.Address
-	factoryContractABI.UnpackIntoInterface(&pairAddr, "getPair", pairResult)
-
-	if pairAddr == (common.Address{}) {
-		return nil, fmt.Errorf("pair does not exist")
-	}
-
-	// Get token0 address
-	token0Data, _ := pairContractABI.Pack("token0")
-	token0Result, err := client.CallContract(ctx, ethereum.CallMsg{To: &pairAddr, Data: token0Data}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get token0: %v", err)
-	}
-	var token0 common.Address
-	pairContractABI.UnpackIntoInterface(&token0, "token0", token0Result)
-
-	// Get reserves
-	reservesData, _ := pairContractABI.Pack("getReserves")
-	reservesResult, err := client.CallContract(ctx, ethereum.CallMsg{To: &pairAddr, Data: reservesData}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get reserves: %v", err)
-	}
-
-	var reserves struct {
-		Reserve0           *big.Int
-		Reserve1           *big.Int
-		BlockTimestampLast uint32
-	}
-	pairContractABI.UnpackIntoInterface(&reserves, "getReserves", reservesResult)
-
-	// Determine which reserve corresponds to which token
-	var ethReserve, tokenReserve *big.Int
-	if token0 == wethAddr {
-		ethReserve = reserves.Reserve0
-		tokenReserve = reserves.Reserve1
-	} else {
-		ethReserve = reserves.Reserve1
-		tokenReserve = reserves.Reserve0
-	}
-
-	// Calculate optimal ETH amount based on current ratio
-	// Formula: ethForLP = (tokenAmount * ethReserve) / tokenReserve
-	ethForLP := new(big.Int).Mul(tokenAmount, ethReserve)
-	ethForLP = new(big.Int).Div(ethForLP, tokenReserve)
-
-	// Use 80% of calculated amount to account for price impact
-	ethForLP = new(big.Int).Mul(ethForLP, big.NewInt(80))
-	ethForLP = new(big.Int).Div(ethForLP, big.NewInt(100))
-
-	return ethForLP, nil
 }
 
 // #############################################################################
@@ -1212,6 +997,5 @@ func monitorBundleInclusion(ctx context.Context, client *ethclient.Client, txs [
 }
 
 func init() {
-	// Set up logging with timestamps
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
